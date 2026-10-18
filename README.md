@@ -54,7 +54,13 @@ host model, not a measurement on real boot hardware.
 
 The parse comes from FHL's optimal parser, priced with ANZ's literal contexts.
 The encoder tries three pricing settings on parallel threads, sharing one
-match finder, and keeps the smallest stream.
+match finder, and keeps the smallest stream. Each setting is a full parse, so
+the sweep is most of the encode time: with threads to spare it is free,
+without them the knobs below trade it for bytes. The (1,0) setting never won
+on firmware, so `-s 2` drops it (1.3x single-threaded for +0.06%) and `-s 1`
+is 2.2x at +0.11%. `-p` sets the price-feedback passes per setting (4 by
+default; 1 costs 0.3%) and `-d` the shared match finder's chain depth (256 by
+default; 64 costs 0.6% and saves a quarter of the time).
 
 ## Use
 
@@ -69,7 +75,7 @@ Build with `-DANZ_DECODER_ONLY` to get just `anz_decode()`. Building with
 slower) symbol decoder; both decoders read the same streams.
 
 ```
-make            # anz c [-l 0..6] [-j threads] in out ; anz d in out
+make            # anz c [-l 0..6] [-p passes] [-d depth] [-s settings] [-j threads] in out
 make test       # round trips under ASan/UBSan, SSE2 and scalar
 ```
 
@@ -83,6 +89,21 @@ every stream they write.
 | upstream `lzsa -f 2` | 15.3 | 16.9 | 9.1 |
 | **anz**, 1 thread | 10.9 | 11.7 | 5.7 |
 | **anz**, 3 threads | 5.3 | 5.2 | 2.8 |
+
+That table predates `-s`/`-p`/`-d` (the defaults are byte for byte the old
+encoder). Rerun on the Ryzen 9 8945HS, clang -O2, one thread, against the same
+1,581,767 B (the settings run in parallel, so at `-j 3` the default and `-s 2`
+both take 2.6 s):
+
+| encoder | time | bytes |
+|---|---:|---:|
+| `-s 3 -p 4 -d 256` (default) | 5.23 s | 1,581,767 |
+| `-s 2 -p 4 -d 256` | **3.98 s** | 1,582,738 (+0.06%) |
+| `-s 1 -p 4 -d 256` | 2.38 s | 1,583,467 (+0.11%) |
+| `-s 2 -p 2 -d 256` | 2.74 s | 1,584,287 (+0.16%) |
+| `-s 1 -p 2 -d 64` | 1.48 s | 1,588,361 (+0.42%) |
+
+clang -O2 encodes 20-25% faster than gcc -O2 across all of these.
 
 ## Limitations
 

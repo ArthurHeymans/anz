@@ -15,7 +15,7 @@
  *    low part; slot extra bits raw except an adaptive 4-bit align field.
  * Raw bits travel in a second, forward LSB-first stream.
  *
- *   anz c [-l lclo] [-j threads] in out   compress (and verify)
+ *   anz c [-l lclo] [-p passes] [-d depth] [-s settings] [-j threads] in out
  *   anz d in out             decompress
  *
  * Stream: u32 size | u8 lclo | u32 raw-stream offset - 9 | two u64 rANS
@@ -407,7 +407,7 @@ struct job {
 	const uint8_t *in;
 	uint32_t n;
 	const struct fhl_mf *m;
-	unsigned K, Kf, lclo;
+	unsigned K, Kf, lclo, passes;
 	uint8_t *out;
 	size_t size;
 };
@@ -415,39 +415,51 @@ static void *run_job(void *arg)
 {
 	struct job *j = arg;
 	struct fhl_seq *s = malloc(sizeof(*s) * ((size_t)j->n + 2));
-	size_t ns = fhl_parse(j->in, j->n, j->m, j->K, j->Kf, s);
+	size_t ns = fhl_parse_passes(j->in, j->n, j->m, j->K, j->Kf, (int)j->passes, s);
 	j->out = malloc((size_t)j->n * 2 + 4096);
 	j->size = encode(j->in, j->n, s, ns, j->lclo, j->out);
 	free(s);
 	return NULL;
 }
 
-/* Smallest stream over three parses, up to 'threads' at a time: K
- * previous-byte and Kf match-byte literal tables steer FHL's parse prices.
- * On coreboot stages these three come within 0.005% of trying five. Ties go
- * to the earlier setting. out needs n * 2 + 4096 bytes. */
-size_t anz_compress(const uint8_t *in, uint32_t n, unsigned lclo, unsigned threads, uint8_t *out)
+/* Parse settings, cheapest first: K previous-byte and Kf match-byte literal
+ * tables steer FHL's parse prices. Each setting is a full parse, so the sweep
+ * is most of the encode time; (1,0) never won on coreboot stages, and -s 2 or
+ * -s 1 trade 0.06% / 0.11% for 1.3x / 2.2x. Ties go to the earlier setting. */
+static const unsigned cfg[][2] = { { 16, 0 }, { 16, 8 }, { 1, 0 } };
+enum { NJ = sizeof(cfg) / sizeof(cfg[0]) };
+
+size_t anz_compress_opts(const uint8_t *in, uint32_t n, const struct anz_opts *o, uint8_t *out)
 {
-	static const unsigned cfg[][2] = { { 16, 0 }, { 1, 0 }, { 16, 8 } };
-	enum { NJ = sizeof(cfg) / sizeof(cfg[0]) };
-	struct fhl_mf *m = fhl_matches(in, n);
+	unsigned lclo = o->lclo, threads = o->threads, passes = o->passes;
+	unsigned ns_ = o->settings < 1 ? 1 : o->settings > NJ ? NJ : o->settings;
+	if (threads < 1) threads = 1;
+	struct fhl_mf *m = fhl_matches_depth(in, n, o->depth);
 	struct job jobs[NJ];
 	pthread_t tid[NJ];
-	for (unsigned k = 0; k < NJ; k++) jobs[k] = (struct job){ in, n, m, cfg[k][0], cfg[k][1], lclo, NULL, 0 };
-	if (threads < 1) threads = 1;
-	for (unsigned a = 0; a < NJ; a += threads) {
-		unsigned b = a + threads < NJ ? a + threads : NJ;
+	for (unsigned k = 0; k < ns_; k++)
+		jobs[k] = (struct job){ in, n, m, cfg[k][0], cfg[k][1], lclo, passes, NULL, 0 };
+	for (unsigned a = 0; a < ns_; a += threads) {
+		unsigned b = a + threads < ns_ ? a + threads : ns_;
 		for (unsigned k = a + 1; k < b; k++) pthread_create(&tid[k], NULL, run_job, &jobs[k]);
 		run_job(&jobs[a]);
 		for (unsigned k = a + 1; k < b; k++) pthread_join(tid[k], NULL);
 	}
 	unsigned best = 0;
-	for (unsigned k = 1; k < NJ; k++) best = jobs[k].size < jobs[best].size ? k : best;
+	for (unsigned k = 1; k < ns_; k++) best = jobs[k].size < jobs[best].size ? k : best;
 	size_t sz = jobs[best].size;
 	memcpy(out, jobs[best].out, sz);
-	for (unsigned k = 0; k < NJ; k++) free(jobs[k].out);
+	for (unsigned k = 0; k < ns_; k++) free(jobs[k].out);
 	fhl_matches_free(m);
 	return sz;
+}
+
+/* The original entry point: 4 passes, hash-chain depth 256, all three
+ * settings. */
+size_t anz_compress(const uint8_t *in, uint32_t n, unsigned lclo, unsigned threads, uint8_t *out)
+{
+	struct anz_opts o = { lclo, threads, 4, 256, 3 };
+	return anz_compress_opts(in, n, &o, out);
 }
 
 #ifndef ANZ_LIB
@@ -468,14 +480,21 @@ int main(int argc, char **argv)
 {
 	static struct anz_models M;
 	unsigned lclo = LCLO_MAX, threads = 3;
+	struct anz_opts o = { LCLO_MAX, 3, 4, 256, 3 };
 	int a = 2;
 	while (a + 1 < argc && argv[a][0] == '-') {
-		if (!strcmp(argv[a], "-l")) lclo = (unsigned)atoi(argv[++a]);
-		else if (!strcmp(argv[a], "-j")) threads = (unsigned)atoi(argv[++a]);
+		if (!strcmp(argv[a], "-l")) o.lclo = (unsigned)atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-p")) o.passes = (unsigned)atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-d")) o.depth = (unsigned)atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-s")) o.settings = (unsigned)atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-j")) o.threads = (unsigned)atoi(argv[++a]);
 		a++;
 	}
-	if (argc - a != 2 || (argv[1][0] != 'c' && argv[1][0] != 'd') || lclo > LCLO_MAX || threads < 1) {
-		fprintf(stderr, "usage: anz c [-l 0..6] [-j threads] in out\n       anz d in out\n");
+	lclo = o.lclo; threads = o.threads;
+	if (argc - a != 2 || (argv[1][0] != 'c' && argv[1][0] != 'd') || lclo > LCLO_MAX || threads < 1 ||
+	    o.depth < 1 || o.settings < 1) {
+		fprintf(stderr, "usage: anz c [-l 0..6] [-p passes] [-d depth] [-s 1..3] [-j threads] in out\n"
+				"       anz d in out\n");
 		return 1;
 	}
 	size_t n, on;
@@ -483,7 +502,7 @@ int main(int argc, char **argv)
 	if (argv[1][0] == 'c') {
 		if (n > 0xffffffffu) { fprintf(stderr, "%s: too large\n", argv[a]); return 1; }
 		out = malloc(n * 2 + 4096);
-		on = anz_compress(in, (uint32_t)n, lclo, threads, out);
+		on = anz_compress_opts(in, (uint32_t)n, &o, out);
 		uint8_t *chk = malloc(n + 1);
 		if (anz_decode(out, on, chk, n, &M) != n || memcmp(chk, in, n)) {
 			fprintf(stderr, "%s: verify failed\n", argv[a]);
