@@ -10,16 +10,16 @@ eight. On coreboot stages it is within 1.1% of LZMA's size and decodes
 Corpus: 28 coreboot stages (romstage, ramstage and postcar from 10 boards),
 3,646,560 bytes. Decode time is the sum of per-stage medians over 7 passes
 on one core, built with gcc `-O2 -march=x86-64-v2`. Decoder size is
-`.text + .rodata` at x86-64 `-Os`. The i5-8350U is a turbo laptop with
-another busy process, but two runs agreed within 3%.
+`.text + .rodata` at x86-64 `-Os`. Two runs on the i5-8350U agreed within
+0.3%.
 
 | codec | bytes | vs LZSA2 | N100 | i5-8350U | decoder | RAM |
 |---|---:|---:|---:|---:|---:|---:|
-| LZMA (coreboot, lc3) | 1,565,241 | −12.8% | 101.1 ms | 104.2 ms | 3.6 KB | 16 KB |
-| **ANZ** | 1,581,767 | −11.9% | **59.9 ms** | **70.3 ms** | 2.9 KB | 83 KB |
+| LZMA (coreboot, lc3) | 1,565,241 | −12.8% | 101.1 ms | 102.4 ms | 3.6 KB | 16 KB |
+| **ANZ** | 1,581,767 | −11.9% | **59.9 ms** | **69.1 ms** | 2.9 KB | 83 KB |
 | ANZ, scalar (no SSE2) | 1,581,767 | −11.9% | 196 ms | | 2.6 KB | 83 KB |
 | zstd -19 (coreboot decoder) | 1,665,519 | −7.2% | 6.7 ms | 6.7 ms | 41 KB | 96 KB |
-| [FHL](https://github.com/ArthurHeymans/fhl) | 1,716,520 | −4.4% | 5.8 ms | 6.6 ms | 3.5 KB | 45 KB |
+| [FHL](https://github.com/ArthurHeymans/fhl) | 1,716,520 | −4.4% | 5.8 ms | 6.5 ms | 3.5 KB | 45 KB |
 | LZSA2, [lzsa2-fast](https://github.com/ArthurHeymans/lzsa2-fast) | 1,795,384 | 0 | 6.4 ms | 6.9 ms | 1.9 KB | 0 |
 
 ANZ is for cases where flash bytes matter more than decode time: a slow SPI
@@ -78,11 +78,11 @@ every stream they write.
 
 | encoder | N100 | i5-8350U | Ryzen 9 8945HS |
 |---|---:|---:|---:|
-| zstd -19 | 0.9 | 1.7 | 0.6 |
-| xz `--format=lzma -9e` | 2.0 | 3.1 | 1.5 |
-| upstream `lzsa -f 2` | 15.3 | 18.8 | 9.1 |
-| **anz**, 1 thread | 10.9 | 18.8 | 5.7 |
-| **anz**, 3 threads | 5.3 | 5.6 | 2.8 |
+| zstd -19 | 0.9 | 1.0 | 0.6 |
+| xz `--format=lzma -9e` | 2.0 | 2.4 | 1.5 |
+| upstream `lzsa -f 2` | 15.3 | 16.9 | 9.1 |
+| **anz**, 1 thread | 10.9 | 11.7 | 5.7 |
+| **anz**, 3 threads | 5.3 | 5.2 | 2.8 |
 
 ## Limitations
 
