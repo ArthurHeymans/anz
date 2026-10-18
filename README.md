@@ -3,7 +3,11 @@
 An LZ77 codec with LZMA-class adaptive modelling, coded as 16-symbol
 (nibble) alphabets with rANS, so a literal takes two decode steps instead of
 eight. On coreboot stages it is within 1.1% of LZMA's size and decodes
-1.5-1.7x faster, with a 2.9 KB decoder.
+1.5-1.7x faster than coreboot's LZMA decoder, with a 2.9 KB decoder. Its
+case is that small decoder: xz's own LZMA decoder is about as fast (from 7%
+slower to 8% faster on the cores measured) and xz -9e is 1% smaller, and
+outside firmware ANZ is not competitive (see
+[Other data and cores](#other-data-and-cores)).
 
 ## Numbers
 
@@ -28,6 +32,38 @@ modelled as flash read plus decode, ANZ comes out best at 15 MHz single-I/O
 for a sequential load, and at 48 MHz quad for an overlapped one. Elsewhere
 the winner is LZMA (overlapped, slower buses) or FHL (sequential). This is a
 host model, not a measurement on real boot hardware.
+
+## Other data and cores
+
+A second harness, `gbench`, times one-core decode of ANZ against xz
+(liblzma, `-9e`, no check) and Brotli (`-q 11`), all built with gcc
+`-O2 -march=x86-64-v2`, in MB/s of output (best of 3 runs of at least 20 ms
+per block).
+
+Decode MB/s on the coreboot corpus:
+
+| codec | bytes | N100 | i5-8350U | Ryzen 9 8945HS |
+|---|---:|---:|---:|---:|
+| xz -9e | 1,566,900 | 57.3 | **56.6** | 105.6 |
+| **ANZ** | 1,581,767 | **61.6** | 52.7 | 105.7 |
+| Brotli -11 | 1,602,957 | 182.0 | 171.2 | 319.0 |
+
+Decode MB/s on 1 MiB blocks of the
+[Silesia corpus](https://sun.aei.polsl.pl/~sdeor/corpus/) (the first 4 MiB of
+each of its 12 files, compressed block by block):
+
+| codec | bytes | N100 | i5-8350U | Ryzen 9 8945HS |
+|---|---:|---:|---:|---:|
+| xz -9e | 16,873,628 | 81.8 | **81.4** | 147.4 |
+| Brotli -11 | 16,989,208 | 300.4 | 291.4 | 494.8 |
+| **ANZ** | 17,576,093 | **88.3** | 76.6 | **151.7** |
+
+On firmware ANZ trades 1% of size against xz for at best 7% of decode speed,
+and Brotli, 1.3% larger, decodes three times faster. On general data ANZ is
+3.5-4% larger than Brotli and xz and decodes at about xz's speed (`-t` makes
+it 1.1% smaller). What ANZ keeps is a 2.9 KB decoder that is 1.5-1.7x faster
+than an LZMA decoder of that size (coreboot's, above); liblzma's decoder is
+much larger, and Brotli's carries a 120 KB dictionary.
 
 ## Design
 
