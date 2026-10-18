@@ -15,11 +15,11 @@ at x86-64 `-Os`.
 | codec | bytes | vs LZSA2 | decode | decoder | RAM |
 |---|---:|---:|---:|---:|---:|
 | LZMA (coreboot, lc3) | 1,565,241 | −12.8% | 101.0 ms | 3.6 KB | 16 KB |
-| **ANZ** | 1,581,693 | −11.9% | **60.0 ms** | 2.9 KB | 83 KB |
-| ANZ, scalar (no SSE2) | 1,581,693 | −11.9% | 196 ms | 2.6 KB | 83 KB |
+| **ANZ** | 1,581,767 | −11.9% | **59.7 ms** | 2.9 KB | 83 KB |
+| ANZ, scalar (no SSE2) | 1,581,767 | −11.9% | 196 ms | 2.6 KB | 83 KB |
 | zstd -19 (coreboot decoder) | 1,665,519 | −7.2% | 6.6 ms | 41 KB | 96 KB |
-| [FHL](https://github.com/ArthurHeymans/fhl) | 1,718,463 | −4.3% | 5.8 ms | 3.5 KB | 45 KB |
-| LZSA2, [lzsa2-fast](https://github.com/ArthurHeymans/lzsa2-fast) | 1,795,384 | 0 | 6.4 ms | 1.9 KB | 0 |
+| [FHL](https://github.com/ArthurHeymans/fhl) | 1,716,520 | −4.4% | 5.7 ms | 3.5 KB | 45 KB |
+| LZSA2, [lzsa2-fast](https://github.com/ArthurHeymans/lzsa2-fast) | 1,795,384 | 0 | 6.3 ms | 1.9 KB | 0 |
 
 ANZ is for cases where flash bytes matter more than decode time: a slow SPI
 bus, or decoding that overlaps the flash read. When boot-time load cost is
@@ -52,7 +52,8 @@ host model, not a measurement on real boot hardware.
 - **Raw bits** travel in a second, forward stream.
 
 The parse comes from FHL's optimal parser, priced with ANZ's literal contexts.
-The encoder tries five pricing settings and keeps the smallest stream.
+The encoder tries three pricing settings on parallel threads, sharing one
+match finder, and keeps the smallest stream.
 
 ## Use
 
@@ -67,11 +68,12 @@ Build with `-DANZ_DECODER_ONLY` to get just `anz_decode()`. Building with
 slower) symbol decoder; both decoders read the same streams.
 
 ```
-make            # anz c [-l 0..6] in out ; anz d in out
+make            # anz c [-l 0..6] [-j threads] in out ; anz d in out
 make test       # round trips under ASan/UBSan, SSE2 and scalar
 ```
 
-The encoder verifies every stream it writes and runs at about 0.35 MB/s.
+The encoder verifies every stream it writes. On one Ryzen 8945HS core it
+compresses 0.8 MB/s, and 1.6 MB/s with its default three threads.
 
 ## Limitations
 

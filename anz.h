@@ -16,7 +16,8 @@
  */
 size_t anz_decode(const void *src, size_t n, void *dst, size_t cap, void *work);
 
-/* Compress in[0..n) into out (n * 2 + 4096 bytes); returns the size. */
-size_t anz_compress(const uint8_t *in, uint32_t n, unsigned lclo, uint8_t *out);
+/* Compress in[0..n) into out (n * 2 + 4096 bytes) with up to 'threads'
+ * threads; lclo 0..6 (6 is best on firmware). Returns the size. */
+size_t anz_compress(const uint8_t *in, uint32_t n, unsigned lclo, unsigned threads, uint8_t *out);
 
 #endif

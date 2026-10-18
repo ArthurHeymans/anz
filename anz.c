@@ -15,7 +15,7 @@
  *    low part; slot extra bits raw except an adaptive 4-bit align field.
  * Raw bits travel in a second, forward LSB-first stream.
  *
- *   anz c [-l lclo] in out   compress (and verify)
+ *   anz c [-l lclo] [-j threads] in out   compress (and verify)
  *   anz d in out             decompress
  *
  * Stream: u32 size | u8 lclo | u32 raw-stream offset - 9 | two u64 rANS
@@ -300,6 +300,7 @@ size_t anz_decode(const void *srcv, size_t n, void *dstv, size_t cap, void *work
 /* ------------------------------------------------------------------ */
 /* encoder: FHL's parser (fhl/fhl.c) produces the LZ parse, ANZ codes it */
 /* ------------------------------------------------------------------ */
+#include <pthread.h>
 #include "fhl/fhl.h"
 
 static unsigned ll_code(uint32_t L) { int c = 15; while (L < ll_base[c]) c--; return c; }
@@ -336,39 +337,39 @@ static void e_raw(struct es *e, uint32_t v, unsigned n)
 static size_t encode(const uint8_t *in, uint32_t size, const struct fhl_seq *s, size_t ns,
 		     unsigned lclo, uint8_t *out)
 {
-	static struct anz_models M;
-	models_init(&M);
+	struct anz_models *M = aligned_alloc(16, sizeof(*M));
+	models_init(M);
 	struct es e = { malloc(1 << 20), 0, 1 << 18, malloc(size + 1024), 0, 0, 0 };
 	uint32_t pos = 0, rep0 = 1;
 	unsigned pml = 0, prep = 0;
 	for (size_t i = 0; i < ns; i++) {
 		unsigned llc = ll_code(s[i].L);
-		e_sym(&e, &M.llm[(pml > 3 ? 3 : pml) * 4 + prep * 2 + (pos & 1)], llc, 16);
+		e_sym(&e, &M->llm[(pml > 3 ? 3 : pml) * 4 + prep * 2 + (pos & 1)], llc, 16);
 		e_raw(&e, s[i].L - ll_base[llc], ll_bits[llc]);
 		for (uint32_t j = 0; j < s[i].L; j++, pos++) {
 			unsigned v = in[pos], last = pos ? in[pos - 1] : 0, hi = v >> 4;
 			if (i > 0 && j == 0) {
 				unsigned mb = in[pos - rep0];
-				e_sym(&e, &M.lhi[256 + (mb >> 4)], hi, 16);
-				e_sym(&e, &M.llo[hi == mb >> 4 ? (16u << LCLO_MAX) + mb
+				e_sym(&e, &M->lhi[256 + (mb >> 4)], hi, 16);
+				e_sym(&e, &M->llo[hi == mb >> 4 ? (16u << LCLO_MAX) + mb
 							       : hi << LCLO_MAX | last >> (8 - lclo)], v & 15, 16);
 			} else {
-				e_sym2(&e, &M.lhi[last], &M.lhi2[last >> (8 - LH2)], hi, 16);
-				e_sym2(&e, &M.llo[hi << LCLO_MAX | last >> (8 - lclo)],
-				       &M.llo2[hi << LL2 | last >> (8 - LL2)], v & 15, 16);
+				e_sym2(&e, &M->lhi[last], &M->lhi2[last >> (8 - LH2)], hi, 16);
+				e_sym2(&e, &M->llo[hi << LCLO_MAX | last >> (8 - lclo)],
+				       &M->llo2[hi << LL2 | last >> (8 - LL2)], v & 15, 16);
 			}
 		}
 		if (!s[i].M) break;
 		unsigned ds = s[i].ds, mlc = ml_code(s[i].M);
-		e_sym(&e, &M.mlm[((llc == 0) * 2 + prep) * 4 + (pos & 3)], mlc, 16);
+		e_sym(&e, &M->mlm[((llc == 0) * 2 + prep) * 4 + (pos & 3)], mlc, 16);
 		e_raw(&e, s[i].M - ml_base[mlc], ml_bits[mlc]);
 		unsigned lb = s[i].M - 2 > 3 ? 3 : s[i].M - 2;
-		e_sym(&e, &M.dh[lb], ds >> 3, 6);
-		e_sym(&e, &M.dl[ds >> 3], ds & 7, 8);
+		e_sym(&e, &M->dh[lb], ds >> 3, 6);
+		e_sym(&e, &M->dl[ds >> 3], ds & 7, 8);
 		if (ds >= 7) {
 			unsigned sl = ds - 3, nb = (sl >> 1) - 1;
 			uint32_t ex = (s[i].d - 1) - ((2u | (sl & 1)) << nb);
-			if (nb >= 4) { e_raw(&e, ex >> 4, nb - 4); e_sym(&e, &M.al, ex & 15, 16); }
+			if (nb >= 4) { e_raw(&e, ex >> 4, nb - 4); e_sym(&e, &M->al, ex & 15, 16); }
 			else e_raw(&e, ex, nb);
 		}
 		pml = mlc; prep = ds < 3;
@@ -397,25 +398,56 @@ static size_t encode(const uint8_t *in, uint32_t size, const struct fhl_seq *s, 
 	for (size_t k = nw; k-- > 0;) { memcpy(p, &words[k], 4); p += 4; }
 	memcpy(p, e.raw, e.rn); p += e.rn;
 	memset(p, 0, 8); p += 8;
-	free(words); free(e.st); free(e.raw);
+	free(words); free(e.st); free(e.raw); free(M);
 	return (size_t)(p - out);
 }
 
-/* Smallest stream over a few parses: K previous-byte and Kf match-byte
- * literal tables steer FHL's parse prices. */
-size_t anz_compress(const uint8_t *in, uint32_t n, unsigned lclo, uint8_t *out)
+/* One parse setting of anz_compress(), run on its own thread. */
+struct job {
+	const uint8_t *in;
+	uint32_t n;
+	const struct fhl_mf *m;
+	unsigned K, Kf, lclo;
+	uint8_t *out;
+	size_t size;
+};
+static void *run_job(void *arg)
 {
-	static const unsigned cfg[][2] = { { 16, 0 }, { 4, 0 }, { 1, 0 }, { 16, 8 }, { 8, 4 } };
-	struct fhl_seq *s = malloc(sizeof(*s) * ((size_t)n + 2));
-	uint8_t *tmp = malloc((size_t)n * 2 + 4096);
-	size_t best = (size_t)-1;
-	for (unsigned c = 0; c < sizeof(cfg) / sizeof(cfg[0]); c++) {
-		size_t ns = fhl_parse(in, n, cfg[c][0], cfg[c][1], s);
-		size_t sz = encode(in, n, s, ns, lclo, tmp);
-		if (sz < best) { best = sz; memcpy(out, tmp, sz); }
+	struct job *j = arg;
+	struct fhl_seq *s = malloc(sizeof(*s) * ((size_t)j->n + 2));
+	size_t ns = fhl_parse(j->in, j->n, j->m, j->K, j->Kf, s);
+	j->out = malloc((size_t)j->n * 2 + 4096);
+	j->size = encode(j->in, j->n, s, ns, j->lclo, j->out);
+	free(s);
+	return NULL;
+}
+
+/* Smallest stream over three parses, up to 'threads' at a time: K
+ * previous-byte and Kf match-byte literal tables steer FHL's parse prices.
+ * On coreboot stages these three come within 0.005% of trying five. Ties go
+ * to the earlier setting. out needs n * 2 + 4096 bytes. */
+size_t anz_compress(const uint8_t *in, uint32_t n, unsigned lclo, unsigned threads, uint8_t *out)
+{
+	static const unsigned cfg[][2] = { { 16, 0 }, { 1, 0 }, { 16, 8 } };
+	enum { NJ = sizeof(cfg) / sizeof(cfg[0]) };
+	struct fhl_mf *m = fhl_matches(in, n);
+	struct job jobs[NJ];
+	pthread_t tid[NJ];
+	for (unsigned k = 0; k < NJ; k++) jobs[k] = (struct job){ in, n, m, cfg[k][0], cfg[k][1], lclo, NULL, 0 };
+	if (threads < 1) threads = 1;
+	for (unsigned a = 0; a < NJ; a += threads) {
+		unsigned b = a + threads < NJ ? a + threads : NJ;
+		for (unsigned k = a + 1; k < b; k++) pthread_create(&tid[k], NULL, run_job, &jobs[k]);
+		run_job(&jobs[a]);
+		for (unsigned k = a + 1; k < b; k++) pthread_join(tid[k], NULL);
 	}
-	free(s); free(tmp);
-	return best;
+	unsigned best = 0;
+	for (unsigned k = 1; k < NJ; k++) best = jobs[k].size < jobs[best].size ? k : best;
+	size_t sz = jobs[best].size;
+	memcpy(out, jobs[best].out, sz);
+	for (unsigned k = 0; k < NJ; k++) free(jobs[k].out);
+	fhl_matches_free(m);
+	return sz;
 }
 
 #ifndef ANZ_LIB
@@ -435,11 +467,15 @@ static uint8_t *slurp(const char *path, size_t *n)
 int main(int argc, char **argv)
 {
 	static struct anz_models M;
-	unsigned lclo = LCLO_MAX;
+	unsigned lclo = LCLO_MAX, threads = 3;
 	int a = 2;
-	if (argc > 3 && !strcmp(argv[2], "-l")) { lclo = (unsigned)atoi(argv[3]); a = 4; }
-	if (argc - a != 2 || (argv[1][0] != 'c' && argv[1][0] != 'd') || lclo > LCLO_MAX) {
-		fprintf(stderr, "usage: anz c [-l 0..6] in out\n       anz d in out\n");
+	while (a + 1 < argc && argv[a][0] == '-') {
+		if (!strcmp(argv[a], "-l")) lclo = (unsigned)atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-j")) threads = (unsigned)atoi(argv[++a]);
+		a++;
+	}
+	if (argc - a != 2 || (argv[1][0] != 'c' && argv[1][0] != 'd') || lclo > LCLO_MAX || threads < 1) {
+		fprintf(stderr, "usage: anz c [-l 0..6] [-j threads] in out\n       anz d in out\n");
 		return 1;
 	}
 	size_t n, on;
@@ -447,7 +483,7 @@ int main(int argc, char **argv)
 	if (argv[1][0] == 'c') {
 		if (n > 0xffffffffu) { fprintf(stderr, "%s: too large\n", argv[a]); return 1; }
 		out = malloc(n * 2 + 4096);
-		on = anz_compress(in, (uint32_t)n, lclo, out);
+		on = anz_compress(in, (uint32_t)n, lclo, threads, out);
 		uint8_t *chk = malloc(n + 1);
 		if (anz_decode(out, on, chk, n, &M) != n || memcmp(chk, in, n)) {
 			fprintf(stderr, "%s: verify failed\n", argv[a]);
