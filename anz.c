@@ -434,7 +434,7 @@ size_t anz_compress_opts(const uint8_t *in, uint32_t n, const struct anz_opts *o
 	unsigned lclo = o->lclo, threads = o->threads, passes = o->passes;
 	unsigned ns_ = o->settings < 1 ? 1 : o->settings > NJ ? NJ : o->settings;
 	if (threads < 1) threads = 1;
-	struct fhl_mf *m = fhl_matches_depth(in, n, o->depth);
+	struct fhl_mf *m = fhl_matches_mt(in, n, o->depth, threads);
 	struct job jobs[NJ];
 	pthread_t tid[NJ];
 	for (unsigned k = 0; k < ns_; k++)

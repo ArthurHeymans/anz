@@ -57,10 +57,11 @@ The encoder tries three pricing settings on parallel threads, sharing one
 match finder, and keeps the smallest stream. Each setting is a full parse, so
 the sweep is most of the encode time: with threads to spare it is free,
 without them the knobs below trade it for bytes. The (1,0) setting never won
-on firmware, so `-s 2` drops it (1.3x single-threaded for +0.06%) and `-s 1`
-is 2.2x at +0.11%. `-p` sets the price-feedback passes per setting (4 by
+on firmware, so `-s 2` drops it (1.25x single-threaded for +0.06%) and `-s 1`
+is 1.8x at +0.11%. `-p` sets the price-feedback passes per setting (4 by
 default; 1 costs 0.3%) and `-d` the shared match finder's chain depth (256 by
-default; 64 costs 0.6% and saves a quarter of the time).
+default; 64 costs 0.6%). The match finder searches on `-j` threads too, with
+the same matches for any thread count.
 
 ## Use
 
@@ -90,20 +91,20 @@ every stream they write.
 | **anz**, 1 thread | 10.9 | 11.7 | 5.7 |
 | **anz**, 3 threads | 5.3 | 5.2 | 2.8 |
 
-That table predates `-s`/`-p`/`-d` (the defaults are byte for byte the old
-encoder). Rerun on the Ryzen 9 8945HS, clang -O2, one thread, against the same
-1,581,767 B (the settings run in parallel, so at `-j 3` the default and `-s 2`
-both take 2.6 s):
+That table predates the current encoder, whose defaults write the same
+streams byte for byte. Rerun on the Ryzen 9 8945HS: the default takes 2.76 s
+on one thread and 1.33 s on three with gcc -O2 (6.30 s and 2.98 s before),
+2.81 s and 1.37 s with clang -O2 (5.05 s and 2.47 s before). The knobs, clang
+-O2, one thread (the settings run in parallel, so at `-j 3` the default and
+`-s 2` both take 1.35 s):
 
 | encoder | time | bytes |
 |---|---:|---:|
-| `-s 3 -p 4 -d 256` (default) | 5.23 s | 1,581,767 |
-| `-s 2 -p 4 -d 256` | **3.98 s** | 1,582,738 (+0.06%) |
-| `-s 1 -p 4 -d 256` | 2.38 s | 1,583,467 (+0.11%) |
-| `-s 2 -p 2 -d 256` | 2.74 s | 1,584,287 (+0.16%) |
-| `-s 1 -p 2 -d 64` | 1.48 s | 1,588,361 (+0.42%) |
-
-clang -O2 encodes 20-25% faster than gcc -O2 across all of these.
+| `-s 3 -p 4 -d 256` (default) | 2.95 s | 1,581,767 |
+| `-s 2 -p 4 -d 256` | **2.34 s** | 1,582,738 (+0.06%) |
+| `-s 1 -p 4 -d 256` | 1.60 s | 1,583,467 (+0.11%) |
+| `-s 2 -p 2 -d 256` | 1.70 s | 1,584,287 (+0.16%) |
+| `-s 1 -p 2 -d 64` | 0.99 s | 1,588,361 (+0.42%) |
 
 ## Limitations
 
