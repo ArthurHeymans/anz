@@ -14,12 +14,14 @@
  * matches from the output, with wide over-copies for the leading nfast
  * commands (counted by the encoder) for which those stay in bounds.
  *
- *   fhl c [-K k] [-p passes] [-d depth] [-f] [-j threads] in out   compress (and verify)
+ *   fhl c [-K k] [-p passes] [-d depth] [-t] [-g] [-f] [-j threads] in out
+ *                                               compress (and verify)
  *   fhl d in out                                 decompress
  *
- * K only enters through the literal prices, so -f prices and emits every
- * K = 1..16 from a single parse (about two thirds of the single-threaded
- * encode time, up to 0.05% larger); the default re-parses for each K.
+ * K only enters through the literal prices, so -f prices every K = 1..16
+ * from a single parse and writes the one with the fewest estimated literal
+ * bits; the default re-parses for each K. -t swaps the hash chains for a
+ * binary tree and -g the flat-priced first parse for a greedy one.
  *
  * Stream: u32 size | u8 K | u32 nlit | u32 nfast | u32 offsets of literal
  * streams A and B and of the distance stream | map | meta lengths | code
@@ -314,67 +316,72 @@ static void put(struct bw *w, uint32_t v, unsigned n)
  *
  * The live nodes sit in slots 0..na-1; each step merges the two lightest
  * (the lower slot wins ties), moves the node in the last slot into the
- * higher freed one and puts the new node in the lower. A heap ordered by
- * (weight, slot) makes those choices in O(log n) instead of a scan. */
-struct hheap { const uint64_t *f; int *slot, *pos, *h, n; };
-static inline int hless(const struct hheap *q, int x, int y)
+ * higher freed one and puts the new node in the lower. A heap of keys
+ * weight:slot:node, all distinct, makes those choices in O(log n). */
+#define HK(f, slot, node) ((f) << 18 | (uint64_t)(slot) << 9 | (uint64_t)(node))
+static inline void hsift(uint64_t *h, int *pos, int n, int i)
 {
-	return q->f[x] < q->f[y] || (q->f[x] == q->f[y] && q->slot[x] < q->slot[y]);
-}
-static inline void hset(struct hheap *q, int i, int x) { q->h[i] = x; q->pos[x] = i; }
-static void hup(struct hheap *q, int i)
-{
-	int x = q->h[i];
-	for (; i > 0 && hless(q, x, q->h[(i - 1) / 2]); i = (i - 1) / 2) hset(q, i, q->h[(i - 1) / 2]);
-	hset(q, i, x);
-}
-static int hpop(struct hheap *q)
-{
-	int top = q->h[0], x = q->h[--q->n], i = 0;
+	uint64_t x = h[i];
 	for (;;) {
 		int c = 2 * i + 1;
-		if (c >= q->n) break;
-		if (c + 1 < q->n && hless(q, q->h[c + 1], q->h[c])) c++;
-		if (!hless(q, q->h[c], x)) break;
-		hset(q, i, q->h[c]); i = c;
+		if (c >= n) break;
+		c += c + 1 < n && h[c + 1] < h[c];
+		if (h[c] >= x) break;
+		h[i] = h[c]; pos[h[i] & 511] = i; i = c;
 	}
-	if (q->n) hset(q, i, x);
-	return top;
+	h[i] = x; pos[x & 511] = i;
+}
+static inline void hrise(uint64_t *h, int *pos, int i)
+{
+	uint64_t x = h[i];
+	for (; i > 0 && x < h[(i - 1) / 2]; i = (i - 1) / 2) { h[i] = h[(i - 1) / 2]; pos[h[i] & 511] = i; }
+	h[i] = x; pos[x & 511] = i;
 }
 
 static void huff_len(const uint32_t *freq, unsigned n, unsigned maxl, uint8_t *len)
 {
-	uint64_t f[512];
-	int par[512], at[512], slot[512], pos[512], h[512];
+	uint64_t f[512], h[512];
+	int par[512], at[512], slot[512], pos[512];
+	uint8_t dep[512];
 	for (unsigned scale = 0;; scale++) {
 		int nn = 0;
 		memset(len, 0, n);
-		struct hheap q = { f, slot, pos, h, 0 };
 		for (unsigned s = 0; s < n; s++)
 			if (freq[s]) {
 				f[nn] = scale ? (freq[s] >> scale) + 1 : freq[s];
-				par[nn] = -1; at[nn] = nn; slot[nn] = nn;
-				hset(&q, q.n++, nn); hup(&q, q.n - 1);
+				at[nn] = nn; slot[nn] = nn;
+				h[nn] = HK(f[nn], nn, nn);
 				nn++;
 			}
 		if (nn == 0) return;
 		if (nn == 1) { for (unsigned s = 0; s < n; s++) if (freq[s]) len[s] = 1; return; }
+		int hn = nn;
+		for (int i = hn / 2; i-- > 0;) hsift(h, pos, hn, i);
+		for (int i = hn / 2; i < hn; i++) pos[h[i] & 511] = i;
 		for (int na = nn; na > 1; nn++) {
-			int a = hpop(&q), b = hpop(&q);
-			f[nn] = f[a] + f[b]; par[nn] = -1;
+			int a = h[0] & 511;
+			h[0] = h[--hn]; hsift(h, pos, hn, 0);
+			int b = h[0] & 511;
+			f[nn] = f[a] + f[b];
 			par[a] = nn; par[b] = nn;
 			int hi = slot[a] > slot[b] ? slot[a] : slot[b], lo = slot[a] + slot[b] - hi;
-			int last = at[--na];
-			if (hi != na) { at[hi] = last; slot[last] = hi; hup(&q, pos[last]); }
+			/* the new node takes b's place in the heap */
 			at[lo] = nn; slot[nn] = lo;
-			hset(&q, q.n++, nn); hup(&q, q.n - 1);
+			h[0] = HK(f[nn], lo, nn); hsift(h, pos, hn, 0);
+			int last = at[--na];
+			if (hi != na) {
+				at[hi] = last; slot[last] = hi;
+				int i = pos[last];
+				h[i] = HK(f[last], hi, last); hrise(h, pos, i);
+			}
 		}
-		unsigned mx = 0, k = 0;
-		for (unsigned s = 0; s < n; s++) {
+		/* depths top-down: parents come after their children */
+		unsigned mx = 0;
+		dep[(nn - 1) & 511] = 0;   /* (the mask quiets a bogus overflow warning) */
+		for (int x = nn - 1; x-- > 0;) dep[x] = dep[par[x]] + 1;
+		for (unsigned s = 0, k = 0; s < n; s++) {
 			if (!freq[s]) continue;
-			unsigned d = 0;
-			for (int x = k; par[x] >= 0; x = par[x]) d++;
-			len[s] = (uint8_t)d; if (d > mx) mx = d;
+			len[s] = dep[k]; if (dep[k] > mx) mx = dep[k];
 			k++;
 		}
 		if (mx <= maxl) return;
@@ -526,8 +533,56 @@ static void mf_one(struct mfseg *g)
 	g->off[g->b - g->a] = (uint32_t)g->c.k;
 }
 
-static void find_matches(const uint8_t *in, uint32_t n, unsigned depth, unsigned threads, struct mf *m)
+/* Binary-tree match finder (as LZMA's bt), for -t: each position goes into
+ * a tree of the earlier positions with its 3-byte hash, ordered by what
+ * follows them, and the search walks at most 'depth' nodes of it. Serial,
+ * but it finds better matches than a chain of the same depth, faster. */
+static void find_matches_tree(const uint8_t *in, uint32_t n, unsigned depth, struct mf *m)
 {
+	enum { HB = 18 };
+	const uint32_t NIL = 0xffffffffu;
+	uint32_t *head = malloc(sizeof(uint32_t) << HB), *son = malloc(8 * ((size_t)n + 1));
+	memset(head, 0xff, sizeof(uint32_t) << HB);
+	struct cbuf b = { NULL, 0, 0 };
+	m->off = malloc(4 * ((size_t)n + 1));
+	struct run r = { 0, 0 };
+	for (uint32_t i = 0; i < n; i++) {
+		m->off[i] = (uint32_t)b.k;
+		if (i + 3 > n) continue;
+		uint32_t max = n - i < MAXM ? n - i : MAXM, nice = max < NICE ? max : NICE;
+		uint32_t h = ((in[i] | in[i + 1] << 8 | in[i + 2] << 16) * 2654435761u) >> (32 - HB);
+		int on = run_on(r, i);
+		if (on) cpush(&b, r.end - i < max ? r.end - i : max, r.d);
+		/* walk down from the root, hanging the smaller suffixes under
+		 * p1 and the larger under p0; len0/len1 are what the bounds
+		 * on each side are known to share with i */
+		uint32_t cur = head[h], *p0 = &son[2 * i + 1], *p1 = &son[2 * i], len0 = 0, len1 = 0, best = 2;
+		head[h] = i;
+		for (unsigned dd = 0;; dd++) {
+			if (cur == NIL || i - cur > MAXD || dd >= depth) { *p0 = *p1 = NIL; break; }
+			uint32_t len = len0 < len1 ? len0 : len1;
+			len += mlen(in + i + len, in + cur + len, nice - len);
+			if (len > best && !on) { best = len; cpush(&b, len, i - cur); }
+			if (len >= nice) { *p1 = son[2 * cur]; *p0 = son[2 * cur + 1]; break; }
+			if (in[cur + len] < in[i + len]) { *p1 = cur; p1 = &son[2 * cur + 1]; cur = *p1; len1 = len; }
+			else { *p0 = cur; p0 = &son[2 * cur]; cur = *p0; len0 = len; }
+		}
+		if (!on && best >= NICE) {
+			/* the tree compares up to NICE: measure the long one fully */
+			struct cand *c = &b.c[b.k - 1];
+			c->len = NICE + mlen(in + i + NICE, in + i - c->dist + NICE, max - NICE);
+			r = (struct run){ i + c->len, c->dist };
+		}
+	}
+	m->off[n] = (uint32_t)b.k;
+	m->c = b.c ? b.c : malloc(sizeof(struct cand));
+	free(head); free(son);
+}
+
+static void find_matches(const uint8_t *in, uint32_t n, unsigned depth, unsigned threads, int tree,
+			 struct mf *m)
+{
+	if (tree) { find_matches_tree(in, n, depth, m); return; }
 	enum { HB = 18 };
 	uint32_t *head = malloc(sizeof(uint32_t) << HB), *prv = malloc(4 * (size_t)n + 4);
 	memset(head, 0xff, sizeof(uint32_t) << HB);
@@ -777,7 +832,17 @@ static void stats(const uint8_t *in, const struct seq *s, size_t ns, int legacy,
 	}
 }
 
-/* k-means of 256 context histograms into K groups by code length */
+/* c[k] = sum of f[x] * cl[x][k] over the literals z seen, for k < kk (a
+ * constant per call site, so the k loop vectorizes) */
+static inline __attribute__((always_inline)) void group_costs(double *c, const uint32_t *f, const uint8_t *z,
+							      unsigned nz, const double (*cl)[MAXK], unsigned kk)
+{
+	for (unsigned i = 0; i < nz; i++) {
+		double v = f[z[i]];
+		for (unsigned k = 0; k < kk; k++) c[k] += v * cl[z[i]][k];
+	}
+}
+
 static void cluster(uint32_t (*pf)[256], unsigned K, uint8_t *map)
 {
 	for (unsigned p = 0; p < 256; p++) map[p] = (uint8_t)((p * K) >> 8);
@@ -788,26 +853,27 @@ static void cluster(uint32_t (*pf)[256], unsigned K, uint8_t *map)
 	unsigned nn[256];
 	for (unsigned p = 0, q = 0; p < 256; q += nn[p++]) {
 		nn[p] = 0;
-		for (unsigned x = 0; x < 256; x++) if (pf[p][x]) nz[q + nn[p]++] = (uint8_t)x;
+		for (unsigned x = 0; x < 256; x++) { nz[q + nn[p]] = (uint8_t)x; nn[p] += pf[p][x] != 0; }
 	}
 	for (int it = 0; it < 30; it++) {
-		memset(sum, 0, sizeof(double[MAXT][256]));
-		for (unsigned p = 0; p < 256; p++)
-			for (unsigned x = 0; x < 256; x++) sum[map[p]][x] += pf[p][x];
+		memset(sum, 0, K * sizeof(*sum));
+		const uint8_t *z = nz;
+		for (unsigned p = 0; p < 256; z += nn[p++])
+			for (unsigned i = 0; i < nn[p]; i++) sum[map[p]][z[i]] += pf[p][z[i]];
 		for (unsigned k = 0; k < K; k++) {
 			double t = 0;
 			for (unsigned x = 0; x < 256; x++) t += sum[k][x] + 0.2;
 			for (unsigned x = 0; x < 256; x++) cl[x][k] = -__builtin_log2((sum[k][x] + 0.2) / t);
 		}
 		int changed = 0;
-		const uint8_t *z = nz;
+		z = nz;
 		for (unsigned p = 0; p < 256; z += nn[p++]) {
 			/* all K costs at once, each summed in literal order */
 			double c[MAXK] = { 0 };
-			for (unsigned i = 0; i < nn[p]; i++) {
-				double v = pf[p][z[i]];
-				for (unsigned k = 0; k < MAXK; k++) c[k] += v * cl[z[i]][k];
-			}
+			if (K <= 2) group_costs(c, pf[p], z, nn[p], cl, 2);
+			else if (K <= 4) group_costs(c, pf[p], z, nn[p], cl, 4);
+			else if (K <= 8) group_costs(c, pf[p], z, nn[p], cl, 8);
+			else group_costs(c, pf[p], z, nn[p], cl, 16);
 			double best = 1e300; unsigned bk = map[p];
 			for (unsigned k = 0; k < K; k++) if (c[k] < best) { best = c[k]; bk = k; }
 			if (bk != map[p]) { map[p] = (uint8_t)bk; changed = 1; }
@@ -850,13 +916,11 @@ static void write_lengths(struct bw *w, const uint8_t *len, unsigned total)
 	free(sy); free(ex);
 }
 
-/* Build code lengths for a parse under a model. */
-static void model_lengths(const uint8_t *in, const struct seq *s, size_t ns, const struct model *md,
-			  uint8_t *len)
+/* Code lengths from a parse's statistics (see stats()) under a model. */
+static void stat_lengths(const uint8_t *in, const struct seq *s, size_t ns, const struct model *md,
+			 uint32_t (*pf)[256], uint32_t (*ff)[256], uint32_t *cf, uint32_t *df, uint8_t *len)
 {
-	uint32_t (*pf)[256] = calloc(256, sizeof(*pf)), (*ff)[256] = calloc(256, sizeof(*ff));
-	uint32_t (*lf)[256] = calloc(MAXT, sizeof(*lf)), cf[NCMD] = {0}, df[NDIST] = {0};
-	stats(in, s, ns, md->legacy, pf, ff, cf, df);
+	uint32_t (*lf)[256] = calloc(MAXT, sizeof(*lf));
 	for (unsigned q = 0; q < 256; q++)
 		for (unsigned x = 0; x < 256; x++) {
 			lf[md->map[q]][x] += pf[q][x];
@@ -875,7 +939,18 @@ static void model_lengths(const uint8_t *in, const struct seq *s, size_t ns, con
 	for (unsigned k = 0; k < T; k++) huff_len(lf[k], NLIT, MAXL, len + k * NLIT);
 	huff_len(cf, NCMD, MAXL, len + T * NLIT);
 	huff_len(df, NDIST, MAXL, len + T * NLIT + NCMD);
-	free(pf); free(ff); free(lf);
+	free(lf);
+}
+
+/* Build code lengths for a parse under a model. */
+static void model_lengths(const uint8_t *in, const struct seq *s, size_t ns, const struct model *md,
+			  uint8_t *len)
+{
+	uint32_t (*pf)[256] = calloc(256, sizeof(*pf)), (*ff)[256] = calloc(256, sizeof(*ff));
+	uint32_t cf[NCMD] = {0}, df[NDIST] = {0};
+	stats(in, s, ns, md->legacy, pf, ff, cf, df);
+	stat_lengths(in, s, ns, md, pf, ff, cf, df, len);
+	free(pf); free(ff);
 }
 
 static void wr32(uint8_t *p, uint32_t v)
@@ -957,11 +1032,11 @@ static size_t emit(const uint8_t *in, uint32_t n, const struct seq *s, size_t ns
 }
 
 static void costs_from(const uint8_t *in, const struct seq *s, size_t ns, const struct model *md,
-		       struct cost *c)
+		       uint32_t (*pf)[256], uint32_t (*ff)[256], uint32_t *cf, uint32_t *df, struct cost *c)
 {
 	uint8_t *len = malloc(NLEN);
 	unsigned T = md->K + md->Kf;
-	model_lengths(in, s, ns, md, len);
+	stat_lengths(in, s, ns, md, pf, ff, cf, df, len);
 	for (unsigned k = 0; k < T; k++) lens_to_cost(len + k * NLIT, NLIT, c->lit[k], 13);
 	lens_to_cost(len + T * NLIT, NCMD, c->cmd, 13);
 	lens_to_cost(len + T * NLIT + NCMD, NDIST, c->dist, 13);
@@ -989,7 +1064,7 @@ static void reprice(const uint8_t *in, const struct seq *s, size_t ns, struct mo
 	stats(in, s, ns, md->legacy, h->pf, h->ff, cf, df);
 	cluster(h->pf, md->K, md->map);
 	cluster(h->ff, md->Kf, md->mapf);
-	costs_from(in, s, ns, md, c);
+	costs_from(in, s, ns, md, h->pf, h->ff, cf, df, c);
 }
 
 /* The first parse: flat prices, so it is the same for every model. */
@@ -1004,6 +1079,37 @@ static size_t parse_flat(const uint8_t *in, uint32_t n, const struct mf *m, stru
 	size_t ns = parse(in, n, m, &md, c, w, s);
 	free(c);
 	return ns;
+}
+
+/* For -g, a lazy greedy parse instead: the longest match (a rep if it is
+ * nearly as long) unless the next position has a longer one. Cheaper than
+ * the flat-priced parse, and only seeds the prices. */
+static size_t parse_greedy(const uint8_t *in, uint32_t n, const struct mf *m, struct seq *s)
+{
+	uint32_t rep[3] = { 1, 1, 1 }, L = 0;
+	size_t k = 0;
+	for (uint32_t i = 0; i < n;) {
+		uint32_t max = n - i < MAXM ? n - i : MAXM, bl = 0, bd = 0, br = 3;
+		for (unsigned r = 0; r < 3; r++) {
+			if (rep[r] > i) continue;
+			uint32_t l = mlen(in + i, in + i - rep[r], max);
+			if (l > bl) { bl = l; br = r; }
+		}
+		uint32_t o = m->off[i + 1];
+		if (o > m->off[i] && m->c[o - 1].len > bl + 1) { bl = m->c[o - 1].len; bd = m->c[o - 1].dist; br = 3; }
+		if (bl < (br < 3 ? 2u : 3u) ||
+		    (br == 3 && i + 1 < n && m->off[i + 2] > m->off[i + 1] && m->c[m->off[i + 2] - 1].len > bl + 1)) {
+			L++; i++;
+			continue;
+		}
+		uint32_t d = br < 3 ? rep[br] : bd;
+		s[k++] = (struct seq){ L, bl, br < 3 ? br : 3 + dist_slot(d - 1), d };
+		if (br == 1) { rep[1] = rep[0]; rep[0] = d; }
+		else if (br != 0) { rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = d; }
+		L = 0; i += bl;
+	}
+	s[k] = (struct seq){ L, 0, 0, 0 };
+	return k + 1;
 }
 
 /* 'passes' rounds of statistics -> prices -> parse, starting from parse s
@@ -1032,6 +1138,7 @@ struct job {
 	const struct seq *s0;           /* flat parse, or with -f the final one */
 	size_t ns0;
 	const struct hist *h;           /* -f: the shared parse's histograms */
+	const uint8_t *map;             /* and the K's map, if already clustered */
 	unsigned K;
 	int passes;
 	struct pws *w;                  /* parse scratch and */
@@ -1045,7 +1152,9 @@ static void *run_job(void *arg)
 	struct model md = { .K = j->K };
 	const struct seq *s = j->s0;
 	size_t ns = j->ns0;
-	if (j->h) {
+	if (j->map) {
+		memcpy(md.map, j->map, 256);
+	} else if (j->h) {
 		cluster(j->h->pf, md.K, md.map);
 	} else {
 		struct hist h;
@@ -1060,21 +1169,51 @@ static void *run_job(void *arg)
 	return NULL;
 }
 
-/* Smallest stream over K = 1..16 (or just Kreq), up to 'threads' K at a
- * time; ties go to the smaller K. 'fast' shares one parse between the K's.
- * Returns the size of the best stream. */
-__attribute__((unused))
-static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, int passes,
-		       unsigned depth, unsigned threads, int fast)
+/* Bits of the literals and their code lengths with K tables clustered from
+ * the histograms pf, leaving the maps in md: -f picks its K by this. */
+static uint64_t lit_bits(uint32_t (*pf)[256], struct model *md)
 {
+	cluster(pf, md->K, md->map);
+	uint32_t (*lf)[256] = calloc(MAXK, sizeof(*lf));
+	for (unsigned q = 0; q < 256; q++)
+		for (unsigned x = 0; x < 256; x++) lf[md->map[q]][x] += pf[q][x];
+	uint8_t *len = calloc(1, NLEN), *buf = malloc(MAXK * NLIT * 2 + 64);
+	uint64_t bits = 256 * log2k(md->K);
+	for (unsigned k = 0; k < md->K; k++) {
+		huff_len(lf[k], NLIT, MAXL, len + k * NLIT);
+		for (unsigned x = 0; x < NLIT; x++) bits += (uint64_t)lf[k][x] * len[k * NLIT + x];
+	}
+	struct bw w = { buf, 0, 0 };
+	write_lengths(&w, len, md->K * NLIT);
+	bits += 8 * (uint64_t)(w.p - buf) + w.cnt;
+	free(lf); free(len); free(buf);
+	return bits;
+}
+
+struct copts {
+	int K, passes;                  /* K 0: try 1..16 */
+	unsigned depth, threads;
+	int fast, tree, greedy;         /* -f, -t, -g */
+};
+
+/* Smallest stream over K = 1..16 (or just o->K), up to o->threads K at a
+ * time; ties go to the smaller K. With o->fast one parse serves every K
+ * and only the K with the fewest literal bits is written. Returns the size
+ * of the stream. */
+__attribute__((unused))
+static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, const struct copts *o)
+{
+	int Kreq = o->K, passes = o->passes, fast = o->fast;
+	unsigned threads = o->threads;
 	struct mf m;
-	find_matches(in, n, depth, threads, &m);
+	find_matches(in, n, o->depth, o->threads, o->tree, &m);
 	struct model md = { .K = Kreq > 0 ? (unsigned)Kreq : PARSE_K };
 	struct seq *s = malloc(sizeof(*s) * ((size_t)n + 2));
 	struct pws w;
 	pws_alloc(&w, n);
-	size_t ns = parse_flat(in, n, &m, &w, s);
+	size_t ns = o->greedy ? parse_greedy(in, n, &m, s) : parse_flat(in, n, &m, &w, s);
 	struct hist h = { NULL, NULL };
+	uint8_t map[256];
 	if (fast) {
 		/* cluster every K from the histograms of the final parse */
 		hist_alloc(&h);
@@ -1082,6 +1221,12 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
 		uint32_t cf[NCMD] = {0}, df[NDIST] = {0};
 		memset(h.pf, 0, 256 * sizeof(*h.pf));
 		stats(in, s, ns, 0, h.pf, h.ff, cf, df);
+		uint64_t bb = ~0ull;
+		for (unsigned K = 1; K <= MAXK && o->K <= 0; K *= 2) {
+			struct model mk = { .K = K };
+			uint64_t e = lit_bits(h.pf, &mk);
+			if (e < bb) { bb = e; Kreq = (int)K; memcpy(map, mk.map, 256); }
+		}
 	}
 	struct job jobs[5];
 	pthread_t tid[5];
@@ -1090,7 +1235,8 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
 	unsigned nj = 0;
 	for (unsigned K = 1; K <= MAXK; K *= 2)
 		if (Kreq <= 0 || K == (unsigned)Kreq)
-			jobs[nj++] = (struct job){ in, n, &m, s, ns, fast ? &h : NULL, K, passes, NULL, NULL, NULL, 0 };
+			jobs[nj++] = (struct job){ in, n, &m, s, ns, fast ? &h : NULL, fast && o->K <= 0 ? map : NULL,
+						   K, passes, NULL, NULL, NULL, 0 };
 	unsigned nw = fast ? 0 : threads < nj ? threads : nj;
 	ws[0] = w;
 	for (unsigned k = 0; k < nw; k++) {
@@ -1121,20 +1267,21 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
  * n + 2 entries; returns the number of commands, the last of which has
  * M == 0 (literals only). */
 struct fhl_mf { struct mf m; struct seq *flat; size_t nflat; };
-struct fhl_mf *fhl_matches_mt(const uint8_t *in, uint32_t n, unsigned depth, unsigned threads)
+struct fhl_mf *fhl_matches_mt(const uint8_t *in, uint32_t n, unsigned depth, unsigned threads,
+			      unsigned flags)
 {
 	struct fhl_mf *f = malloc(sizeof(*f));
 	struct pws w;
-	find_matches(in, n, depth, threads, &f->m);
+	find_matches(in, n, depth, threads, flags & FHL_MF_TREE, &f->m);
 	pws_alloc(&w, n);
 	f->flat = malloc(sizeof(*f->flat) * ((size_t)n + 2));
-	f->nflat = parse_flat(in, n, &f->m, &w, f->flat);
+	f->nflat = flags & FHL_MF_GREEDY ? parse_greedy(in, n, &f->m, f->flat) : parse_flat(in, n, &f->m, &w, f->flat);
 	pws_free(&w);
 	return f;
 }
 struct fhl_mf *fhl_matches(const uint8_t *in, uint32_t n)
 {
-	return fhl_matches_mt(in, n, 256, 1);
+	return fhl_matches_mt(in, n, 256, 1, 0);
 }
 void fhl_matches_free(struct fhl_mf *f)
 {
@@ -1176,24 +1323,27 @@ static uint8_t *slurp(const char *path, size_t *n)
 
 int main(int argc, char **argv)
 {
-	int K = 0, passes = 1, fast = 0;
-	unsigned depth = 256, threads = 5;
+	struct copts o = { .K = 0, .passes = 1, .depth = 256, .threads = 5 };
 	int a = 2;
 	while (a < argc && argv[a][0] == '-') {
-		if (!strcmp(argv[a], "-f")) { fast = 1; a++; continue; }
+		if (!strcmp(argv[a], "-f")) { o.fast = 1; a++; continue; }
+		if (!strcmp(argv[a], "-t")) { o.tree = 1; a++; continue; }
+		if (!strcmp(argv[a], "-g")) { o.greedy = 1; a++; continue; }
 		if (a + 1 >= argc) break;
-		if (!strcmp(argv[a], "-K")) K = atoi(argv[++a]);
-		else if (!strcmp(argv[a], "-p")) passes = atoi(argv[++a]);
-		else if (!strcmp(argv[a], "-d")) depth = (unsigned)atoi(argv[++a]);
-		else if (!strcmp(argv[a], "-j")) threads = (unsigned)atoi(argv[++a]);
+		if (!strcmp(argv[a], "-K")) o.K = atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-p")) o.passes = atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-d")) o.depth = (unsigned)atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-j")) o.threads = (unsigned)atoi(argv[++a]);
 		a++;
 	}
 	if (argc - a != 2 || (argv[1][0] != 'c' && argv[1][0] != 'd') ||
-	    (K && (K > MAXK || (K & (K - 1)))) || threads < 1) {
-		fprintf(stderr, "usage: fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-f] [-j threads] in out\n"
+	    (o.K && (o.K > MAXK || (o.K & (o.K - 1)))) || o.threads < 1) {
+		fprintf(stderr, "usage: fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-t] [-g] [-f] [-j threads] in out\n"
 				"       fhl d in out\n"
-				"  -f  price every K from one parse: faster, up to 0.05%%\n"
-				"      larger streams (default re-parses for each K)\n");
+				"  -t  binary-tree match finder (serial; faster on one core, finds more)\n"
+				"  -g  seed the prices with a greedy parse instead of a flat-priced one\n"
+				"  -f  price every K from one parse and write the most promising\n"
+				"  -t -g -f together: about 2.5x faster for about 0.1%% larger\n");
 		return 1;
 	}
 	size_t n, on;
@@ -1202,7 +1352,7 @@ int main(int argc, char **argv)
 	if (argv[1][0] == 'c') {
 		if (n > 0xffffffffu) { fprintf(stderr, "%s: too large\n", argv[a]); return 1; }
 		out = malloc(n * 2 + 65536);
-		on = compress(in, (uint32_t)n, out, K, passes, depth, threads, fast);
+		on = compress(in, (uint32_t)n, out, &o);
 		uint8_t *chk = malloc(n + 1);
 		if (fhl_decode(out, on, chk, n, &t) != n || memcmp(chk, in, n)) {
 			fprintf(stderr, "%s: verify failed\n", argv[a]);

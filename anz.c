@@ -434,7 +434,8 @@ size_t anz_compress_opts(const uint8_t *in, uint32_t n, const struct anz_opts *o
 	unsigned lclo = o->lclo, threads = o->threads, passes = o->passes;
 	unsigned ns_ = o->settings < 1 ? 1 : o->settings > NJ ? NJ : o->settings;
 	if (threads < 1) threads = 1;
-	struct fhl_mf *m = fhl_matches_mt(in, n, o->depth, threads);
+	struct fhl_mf *m = fhl_matches_mt(in, n, o->depth, threads,
+					  (o->tree ? FHL_MF_TREE : 0) | (o->greedy ? FHL_MF_GREEDY : 0));
 	struct job jobs[NJ];
 	pthread_t tid[NJ];
 	for (unsigned k = 0; k < ns_; k++)
@@ -458,7 +459,7 @@ size_t anz_compress_opts(const uint8_t *in, uint32_t n, const struct anz_opts *o
  * settings. */
 size_t anz_compress(const uint8_t *in, uint32_t n, unsigned lclo, unsigned threads, uint8_t *out)
 {
-	struct anz_opts o = { lclo, threads, 4, 256, 3 };
+	struct anz_opts o = { lclo, threads, 4, 256, 3, 0, 0 };
 	return anz_compress_opts(in, n, &o, out);
 }
 
@@ -480,9 +481,12 @@ int main(int argc, char **argv)
 {
 	static struct anz_models M;
 	unsigned lclo = LCLO_MAX, threads = 3;
-	struct anz_opts o = { LCLO_MAX, 3, 4, 256, 3 };
+	struct anz_opts o = { LCLO_MAX, 3, 4, 256, 3, 0, 0 };
 	int a = 2;
-	while (a + 1 < argc && argv[a][0] == '-') {
+	while (a < argc && argv[a][0] == '-') {
+		if (!strcmp(argv[a], "-t")) { o.tree = 1; a++; continue; }
+		if (!strcmp(argv[a], "-g")) { o.greedy = 1; a++; continue; }
+		if (a + 1 >= argc) break;
 		if (!strcmp(argv[a], "-l")) o.lclo = (unsigned)atoi(argv[++a]);
 		else if (!strcmp(argv[a], "-p")) o.passes = (unsigned)atoi(argv[++a]);
 		else if (!strcmp(argv[a], "-d")) o.depth = (unsigned)atoi(argv[++a]);
@@ -493,8 +497,11 @@ int main(int argc, char **argv)
 	lclo = o.lclo; threads = o.threads;
 	if (argc - a != 2 || (argv[1][0] != 'c' && argv[1][0] != 'd') || lclo > LCLO_MAX || threads < 1 ||
 	    o.depth < 1 || o.settings < 1) {
-		fprintf(stderr, "usage: anz c [-l 0..6] [-p passes] [-d depth] [-s 1..3] [-j threads] in out\n"
-				"       anz d in out\n");
+		fprintf(stderr, "usage: anz c [-l 0..6] [-p passes] [-d depth] [-s 1..3] [-t] [-g] [-j threads] in out\n"
+				"       anz d in out\n"
+				"  -t  binary-tree match finder (serial; faster on one core, finds more)\n"
+				"  -g  seed the prices with a greedy parse instead of a flat-priced one\n"
+				"  fastest: -s 1 -p 1 -t -g\n");
 		return 1;
 	}
 	size_t n, on;

@@ -25,9 +25,13 @@ size_t anz_compress(const uint8_t *in, uint32_t n, unsigned lclo, unsigned threa
  * tried (3 by default; 2 is within 0.06% on firmware), 'passes' is the FHL
  * price-feedback passes per setting (4 by default, 1 costs 0.3%), and
  * 'depth' is the hash-chain depth of the shared match finder (256 by default;
- * 64 costs 0.6%). The match finder runs on up to 'threads' threads too. */
+ * 64 costs 0.6%). The match finder runs on up to 'threads' threads too,
+ * unless 'tree' picks FHL's serial binary-tree match finder (faster on one
+ * core, finds more); 'greedy' seeds the prices with a greedy parse instead
+ * of a flat-priced optimal one. */
 struct anz_opts {
 	unsigned lclo, threads, passes, depth, settings;
+	int tree, greedy;
 };
 size_t anz_compress_opts(const uint8_t *in, uint32_t n, const struct anz_opts *o, uint8_t *out);
 

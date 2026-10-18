@@ -61,7 +61,10 @@ on firmware, so `-s 2` drops it (1.25x single-threaded for +0.06%) and `-s 1`
 is 1.8x at +0.11%. `-p` sets the price-feedback passes per setting (4 by
 default; 1 costs 0.3%) and `-d` the shared match finder's chain depth (256 by
 default; 64 costs 0.6%). The match finder searches on `-j` threads too, with
-the same matches for any thread count.
+the same matches for any thread count. `-t` uses FHL's binary-tree match
+finder instead (serial, but faster on one core and it finds more) and `-g`
+seeds the prices with a greedy parse instead of the flat-priced one:
+`-s 1 -p 1 -t -g` encodes about as fast as `zstd -19` and 4% smaller.
 
 ## Use
 
@@ -76,7 +79,7 @@ Build with `-DANZ_DECODER_ONLY` to get just `anz_decode()`. Building with
 slower) symbol decoder; both decoders read the same streams.
 
 ```
-make            # anz c [-l 0..6] [-p passes] [-d depth] [-s settings] [-j threads] in out
+make            # anz c [-l 0..6] [-p passes] [-d depth] [-s settings] [-t] [-g] [-j threads] in out
 make test       # round trips under ASan/UBSan, SSE2 and scalar
 ```
 
@@ -92,19 +95,20 @@ every stream they write.
 | **anz**, 3 threads | 5.3 | 5.2 | 2.8 |
 
 That table predates the current encoder, whose defaults write the same
-streams byte for byte. Rerun on the Ryzen 9 8945HS: the default takes 2.76 s
-on one thread and 1.33 s on three with gcc -O2 (6.30 s and 2.98 s before),
-2.81 s and 1.37 s with clang -O2 (5.05 s and 2.47 s before). The knobs, clang
--O2, one thread (the settings run in parallel, so at `-j 3` the default and
-`-s 2` both take 1.35 s):
+streams byte for byte. Rerun on the Ryzen 9 8945HS, gcc -O2, one thread
+unless noted (zstd -19: 0.56 s, 1,665,631 B; xz `--format=lzma -9e`: 1.56 s,
+1,565,605 B):
 
 | encoder | time | bytes |
 |---|---:|---:|
-| `-s 3 -p 4 -d 256` (default) | 2.95 s | 1,581,767 |
-| `-s 2 -p 4 -d 256` | **2.34 s** | 1,582,738 (+0.06%) |
-| `-s 1 -p 4 -d 256` | 1.60 s | 1,583,467 (+0.11%) |
-| `-s 2 -p 2 -d 256` | 1.70 s | 1,584,287 (+0.16%) |
-| `-s 1 -p 2 -d 64` | 0.99 s | 1,588,361 (+0.42%) |
+| default (before) | 6.30 s | 1,581,767 |
+| default | 2.48 s | 1,581,767 |
+| default, 3 threads (before) | 2.98 s | 1,581,767 |
+| default, 3 threads | 1.23 s | 1,581,767 |
+| `-t` | 2.23 s | 1,580,517 (-0.08%) |
+| `-s 2` | 1.98 s | 1,582,738 (+0.06%) |
+| `-s 1 -t` | 1.12 s | 1,582,406 (+0.04%) |
+| `-s 1 -p 1 -t -g` | **0.63 s** | 1,592,594 (+0.68%) |
 
 ## Limitations
 
